@@ -1,0 +1,92 @@
+name: Build all-sources iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+      - name: Build all-sources iOS app
+        run: python3 scripts/build_ios.py --all-sources
+      - name: Package unsigned IPA and verify archive
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import shutil
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+          from scripts.app_build import BuildVariant
+
+          root = Path.cwd()
+          app = root / 'build/ios/iphoneos/Runner.app'
+          if not (app / 'Info.plist').is_file() or not (app / 'Runner').is_file():
+              raise SystemExit('Missing built Runner.app')
+          version_match = re.search(r'^version:\s*(\S+)', (root / 'pubspec.yaml').read_text(encoding='utf-8'), re.MULTILINE)
+          if not version_match:
+              raise SystemExit('Missing app version')
+          output = root / 'dist/ios'
+          output.mkdir(parents=True, exist_ok=True)
+          name = f'{BuildVariant(True).slug}-{version_match.group(1)}-ios-unsigned.ipa'
+          ipa = output / name
+          ipa.unlink(missing_ok=True)
+          with tempfile.TemporaryDirectory(prefix='ios-ipa-') as temporary:
+              staging = Path(temporary)
+              payload = staging / 'Payload'
+              payload.mkdir()
+              shutil.copytree(app, payload / 'Runner.app', symlinks=True)
+              subprocess.run(['zip', '-qry', str(ipa), 'Payload'], cwd=staging, check=True)
+          with zipfile.ZipFile(ipa) as archive:
+              required = {'Payload/Runner.app/Info.plist', 'Payload/Runner.app/Runner'}
+              if not required.issubset(set(archive.namelist())):
+                  raise SystemExit('Invalid IPA directory structure')
+              bad_entry = archive.testzip()
+              if bad_entry:
+                  raise SystemExit(f'Invalid ZIP entry: {bad_entry}')
+          digest = hashlib.sha256()
+          with ipa.open('rb') as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                  digest.update(chunk)
+          (output / 'SHA256SUMS-IPA.txt').write_text(f'{digest.hexdigest()}  {name}\n', encoding='ascii')
+          print(ipa)
+          print(f'SHA256 {digest.hexdigest()}')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zhenguojian-ios-unsigned
+          path: |
+            dist/ios/*-ios-unsigned.ipa
+            dist/ios/SHA256SUMS-IPA.txt
+          if-no-files-found: error
+          retention-days: 14
